@@ -463,7 +463,7 @@ function save() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'moza-' + baseName + '.png';
+    a.download = 'mozarina-' + baseName + '.png';
     document.body.appendChild(a);
     a.click();
     a.remove();
