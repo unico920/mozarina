@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>モザリナ</title>
+<!--
+  モザリナ: 画像の一部にモザイク（四角 / ぼかし / 塗りつぶし）をかけて PNG で保存するツール。
+  - ファイルを開くだけで動く（サーバー・外部ライブラリ不要）
+  - 塗りつぶしは元の情報が一切残らないので、絶対に読まれたくない文字に使う
+  - 画像はブラウザの中だけで処理し、どこにも送信しない
+-->
+<style>
+  :root {
+    --bg: #f4f4f5; --panel: #ffffff; --text: #18181b; --muted: #71717a;
+    --border: #d4d4d8; --accent: #2563eb; --accent-text: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #18181b; --panel: #27272a; --text: #f4f4f5; --muted: #a1a1aa;
+      --border: #3f3f46; --accent: #3b82f6; --accent-text: #ffffff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .group { display: flex; align-items: center; gap: 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
+  .strength-value { min-width: 3.5em; color: var(--muted); font-variant-numeric: tabular-nums; }
+  main {
+    flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+    padding: 16px; position: relative;
+  }
+  #drop {
+    width: min(560px, 100%); padding: 48px 24px; text-align: center; cursor: pointer;
+    border: 2px dashed var(--border); border-radius: 12px; color: var(--muted); line-height: 2;
+  }
+  main.dragover #drop, main.dragover #stage { outline: 3px solid var(--accent); outline-offset: 4px; }
+  #stage { position: relative; display: none; max-width: 100%; max-height: 100%; line-height: 0; }
+  #canvas {
+    display: block; max-width: 100%; max-height: calc(100vh - 120px);
+    cursor: crosshair; touch-action: none;
+    /* 透過部分が分かるように市松模様 */
+    background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 16px 16px;
+  }
+  #sel {
+    position: absolute; display: none; pointer-events: none;
+    border: 1px dashed #fff; outline: 1px dashed #000; background: rgba(37, 99, 235, .15);
+  }
+  [hidden] { display: none !important; }
+  body.loaded #drop { display: none; }
+  body.loaded #stage { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>モザリナ</h1>
+  <button id="openBtn" type="button">画像を開く</button>
+  <div class="group">
+    <span>モード</span>
+    <div class="seg" role="group" aria-label="モード">
+      <button type="button" data-mode="pixel" aria-pressed="true">四角</button>
+      <button type="button" data-mode="blur" aria-pressed="false">ぼかし</button>
+      <button type="button" data-mode="fill" aria-pressed="false">塗りつぶし</button>
+    </div>
+  </div>
+  <label id="strengthGroup" class="group">
+    <span>強さ</span>
+    <input id="strength" type="range">
+    <span id="strengthValue" class="strength-value"></span>
+  </label>
+  <label id="colorGroup" class="group" hidden>
+    <span>色</span>
+    <input id="fillColor" type="color" value="#000000">
+  </label>
+  <button id="undoBtn" type="button" disabled>元に戻す</button>
+  <button id="saveBtn" type="button" class="primary" disabled>保存</button>
+  <input id="file" type="file" accept="image/*" hidden>
+</header>
+<main id="main">
+  <div id="drop">
+    ここに画像をドロップ<br>
+    クリックで選択<br>
+    Ctrl+V（Mac は ⌘+V）で貼り付け
+  </div>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="sel"></div>
+  </div>
+</main>
+<script>
+'use strict';
+
+const MODES = {
+  pixel: { min: 4, max: 64, value: 16, unit: 'px' }, // ブロックの大きさ
+  blur:  { min: 2, max: 40, value: 12, unit: 'px' }, // ぼかしの半径
+  fill:  null,                                        // 塗りつぶしは強さなし（色を選ぶ）
+};
+const MAX_UNDO = 30;
+const MIN_SELECTION = 4;
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const stage = $('stage');
+const sel = $('sel');
+const main = $('main');
+const fileInput = $('file');
+const strength = $('strength');
+const strengthValue = $('strengthValue');
+const undoBtn = $('undoBtn');
+const saveBtn = $('saveBtn');
+
+let mode = 'pixel';
+let baseName = 'image';
+let loaded = false;
+let undoStack = [];
+let drag = null; // { x0, y0, x1, y1 } 画面上の座標（canvas 左上基準、CSS px）
+
+/* ---------- 画面の更新 ---------- */
+
+function refreshStrength() {
+  const m = MODES[mode];
+  $('strengthGroup').hidden = !m;
+  $('colorGroup').hidden = !!m;
+  document.querySelectorAll('[data-mode]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.mode === mode));
+  });
+  if (!m) return;
+  strength.min = m.min;
+  strength.max = m.max;
+  strength.value = m.value;
+  strengthValue.textContent = m.value + m.unit;
+}
+
+function refreshButtons() {
+  undoBtn.disabled = undoStack.length === 0;
+  saveBtn.disabled = !loaded;
+}
+
+document.querySelectorAll('[data-mode]').forEach((b) => {
+  b.addEventListener('click', () => { mode = b.dataset.mode; refreshStrength(); });
+});
+strength.addEventListener('input', () => {
+  MODES[mode].value = Number(strength.value);
+  strengthValue.textContent = strength.value + MODES[mode].unit;
+});
+
+/* ---------- 読み込み ---------- */
+
+// 最後の拡張子だけ外す（a.b.webp → a.b）。名前が無ければ image
+function stripExtension(name) {
+  const base = (name || '').replace(/^.*[\\/]/, '').replace(/\.[^.]*$/, '');
+  return base || 'image';
+}
+
+async function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file); // EXIF の向きは自動で反映される
+  } catch (e) {
+    alert('この画像は読み込めませんでした。');
+    return;
+  }
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close && bitmap.close();
+  baseName = stripExtension(file.name);
+  undoStack = [];
+  loaded = true;
+  document.body.classList.add('loaded');
+  document.title = 'モザリナ - ' + baseName;
+  refreshButtons();
+}
+
+$('openBtn').addEventListener('click', () => fileInput.click());
+$('drop').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  loadFile(fileInput.files[0]);
+  fileInput.value = ''; // 同じファイルをもう一度選べるように
+});
+
+main.addEventListener('dragover', (e) => { e.preventDefault(); main.classList.add('dragover'); });
+main.addEventListener('dragleave', (e) => {
+  if (!main.contains(e.relatedTarget)) main.classList.remove('dragover');
+});
+main.addEventListener('drop', (e) => {
+  e.preventDefault();
+  main.classList.remove('dragover');
+  const file = [...e.dataTransfer.files].find((f) => f.type.startsWith('image/'));
+  loadFile(file);
+});
+// ページ外へのドロップでブラウザが画像を開いてしまうのを防ぐ
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => e.preventDefault());
+
+document.addEventListener('paste', (e) => {
+  const item = [...(e.clipboardData?.items || [])].find((i) => i.kind === 'file' && i.type.startsWith('image/'));
+  if (!item) return;
+  e.preventDefault();
+  loadFile(item.getAsFile());
+});
+
+/* ---------- 範囲選択 ---------- */
+
+function pointInCanvas(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function drawSelection() {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(drag.x0, drag.x1));
+  const y = Math.max(0, Math.min(drag.y0, drag.y1));
+  const x2 = Math.min(r.width, Math.max(drag.x0, drag.x1));
+  const y2 = Math.min(r.height, Math.max(drag.y0, drag.y1));
+  Object.assign(sel.style, {
+    display: 'block',
+    left: x + 'px', top: y + 'px',
+    width: Math.max(0, x2 - x) + 'px', height: Math.max(0, y2 - y) + 'px',
+  });
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (!loaded || e.button !== 0) return;
+  canvas.setPointerCapture(e.pointerId);
+  const p = pointInCanvas(e);
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  drawSelection();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const p = pointInCanvas(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  drawSelection();
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (!drag) return;
+  const p = pointInCanvas(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  finishSelection();
+});
+canvas.addEventListener('pointercancel', () => { drag = null; sel.style.display = 'none'; });
+
+function finishSelection() {
+  // 表示サイズ → 元解像度へ換算（縮小率は表示幅と内部幅の比で決まる）
+  const r = canvas.getBoundingClientRect();
+  const sx = canvas.width / r.width;
+  const sy = canvas.height / r.height;
+  const clampX = (v) => Math.max(0, Math.min(canvas.width, v));
+  const clampY = (v) => Math.max(0, Math.min(canvas.height, v));
+  const x = clampX(Math.round(Math.min(drag.x0, drag.x1) * sx));
+  const y = clampY(Math.round(Math.min(drag.y0, drag.y1) * sy));
+  const x2 = clampX(Math.round(Math.max(drag.x0, drag.x1) * sx));
+  const y2 = clampY(Math.round(Math.max(drag.y0, drag.y1) * sy));
+  drag = null;
+  sel.style.display = 'none';
+  const w = x2 - x, h = y2 - y;
+  if (w < MIN_SELECTION || h < MIN_SELECTION) return;
+  applyEffect(x, y, w, h);
+}
+
+/* ---------- モザイク処理 ---------- */
+
+function applyEffect(x, y, w, h) {
+  undoStack.push({ x, y, data: ctx.getImageData(x, y, w, h) });
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  if (mode === 'fill') {
+    // 不透明な色で上書きするので、元の絵の情報は何も残らない
+    ctx.fillStyle = $('fillColor').value;
+    ctx.fillRect(x, y, w, h);
+  } else {
+    const img = ctx.getImageData(x, y, w, h);
+    if (mode === 'pixel') pixelate(img, MODES.pixel.value);
+    else blur(img, MODES.blur.value);
+    ctx.putImageData(img, x, y);
+  }
+  refreshButtons();
+}
+
+// 四角: 選択範囲の左上から size px 四方に区切り、各ブロックを平均色で塗る（端の余りは小さいまま）
+function pixelate(img, size) {
+  const { width: w, height: h, data: d } = img;
+  for (let by = 0; by < h; by += size) {
+    const bh = Math.min(size, h - by);
+    for (let bx = 0; bx < w; bx += size) {
+      const bw = Math.min(size, w - bx);
+      // 透明な部分の色が混ざらないよう、不透明度で重みづけして平均
+      let r = 0, g = 0, b = 0, a = 0;
+      for (let yy = by; yy < by + bh; yy++) {
+        for (let xx = bx; xx < bx + bw; xx++) {
+          const i = (yy * w + xx) * 4;
+          const al = d[i + 3];
+          r += d[i] * al; g += d[i + 1] * al; b += d[i + 2] * al; a += al;
+        }
+      }
+      const n = bw * bh;
+      const R = a ? r / a : 0, G = a ? g / a : 0, B = a ? b / a : 0, A = a / n;
+      for (let yy = by; yy < by + bh; yy++) {
+        for (let xx = bx; xx < bx + bw; xx++) {
+          const i = (yy * w + xx) * 4;
+          d[i] = R; d[i + 1] = G; d[i + 2] = B; d[i + 3] = A;
+        }
+      }
+    }
+  }
+}
+
+// ぼかし: ボックスブラーを縦横3回ずつかけてガウスぼかしに近づける
+// 範囲の外は端のピクセルをくり返し参照する（枠際が透けたり暗くなったりしない）
+function blur(img, radius) {
+  const { width: w, height: h, data: d } = img;
+  const n = w * h;
+  // 透過を正しく扱うため、色に不透明度を掛けた状態でぼかす
+  const ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+  for (let p = 0; p < n; p++) {
+    const a = d[p * 4 + 3] / 255;
+    ch[0][p] = d[p * 4] * a;
+    ch[1][p] = d[p * 4 + 1] * a;
+    ch[2][p] = d[p * 4 + 2] * a;
+    ch[3][p] = d[p * 4 + 3];
+  }
+  const tmp = new Float32Array(n);
+  for (const c of ch) {
+    for (let pass = 0; pass < 3; pass++) {
+      boxPass(c, tmp, w, h, radius, true);
+      boxPass(tmp, c, w, h, radius, false);
+    }
+  }
+  for (let p = 0; p < n; p++) {
+    const a = ch[3][p];
+    const k = a > 0 ? 255 / a : 0;
+    d[p * 4] = ch[0][p] * k;
+    d[p * 4 + 1] = ch[1][p] * k;
+    d[p * 4 + 2] = ch[2][p] * k;
+    d[p * 4 + 3] = a;
+  }
+}
+
+// 1方向のボックスブラー（移動合計で高速化）。horizontal=false なら縦方向
+function boxPass(src, dst, w, h, r, horizontal) {
+  const len = horizontal ? w : h;
+  const lines = horizontal ? h : w;
+  const step = horizontal ? 1 : w;
+  const div = r * 2 + 1;
+  for (let line = 0; line < lines; line++) {
+    const start = horizontal ? line * w : line;
+    const at = (i) => src[start + Math.max(0, Math.min(len - 1, i)) * step];
+    let sum = 0;
+    for (let i = -r; i <= r; i++) sum += at(i);
+    for (let i = 0; i < len; i++) {
+      dst[start + i * step] = sum / div;
+      sum += at(i + r + 1) - at(i - r);
+    }
+  }
+}
+
+/* ---------- 元に戻す ---------- */
+
+function undo() {
+  const last = undoStack.pop();
+  if (!last) return;
+  ctx.putImageData(last.data, last.x, last.y);
+  refreshButtons();
+}
+undoBtn.addEventListener('click', undo);
+
+/* ---------- 保存 ---------- */
+
+function save() {
+  if (!loaded) return;
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'moza-' + baseName + '.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, 'image/png');
+}
+saveBtn.addEventListener('click', save);
+
+/* ---------- ショートカット ---------- */
+
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === 's') { e.preventDefault(); save(); }
+  else if (key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+});
+
+refreshStrength();
+refreshButtons();
+</script>
+</body>
+</html>
