@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>モザリナ</title>
 <!--
-  モザリナ: 画像の一部にモザイク（四角 / ぼかし / 塗りつぶし）をかけて PNG で保存するツール。
+  モザリナ: 画像の一部にモザイク / ぼかし / 塗りつぶしをかけて PNG で保存するツール。
   - ファイルを開くだけで動く（サーバー・外部ライブラリ不要）
+  - 透かし（任意の文字を斜めに敷き詰める）は保存時に焼き込む
   - 塗りつぶしは元の情報が一切残らないので、絶対に読まれたくない文字に使う
   - 画像はブラウザの中だけで処理し、どこにも送信しない
 -->
@@ -60,6 +61,9 @@
     /* 透過部分が分かるように市松模様 */
     background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 16px 16px;
   }
+  #wm { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+  #wmText { font: inherit; width: 11em; padding: 5px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); }
   #sel {
     position: absolute; display: none; pointer-events: none;
     border: 1px dashed #fff; outline: 1px dashed #000; background: rgba(37, 99, 235, .15);
@@ -76,7 +80,7 @@
   <div class="group">
     <span>モード</span>
     <div class="seg" role="group" aria-label="モード">
-      <button type="button" data-mode="pixel" aria-pressed="true">四角</button>
+      <button type="button" data-mode="pixel" aria-pressed="true">モザイク</button>
       <button type="button" data-mode="blur" aria-pressed="false">ぼかし</button>
       <button type="button" data-mode="fill" aria-pressed="false">塗りつぶし</button>
     </div>
@@ -90,6 +94,10 @@
     <span>色</span>
     <input id="fillColor" type="color" value="#000000">
   </label>
+  <div class="group">
+    <label class="group"><input id="wmOn" type="checkbox"> 透かし</label>
+    <input id="wmText" type="text" placeholder="@アカウント名" aria-label="透かしの文字">
+  </div>
   <button id="undoBtn" type="button" disabled>元に戻す</button>
   <button id="saveBtn" type="button" class="primary" disabled>保存</button>
   <input id="file" type="file" accept="image/*" hidden>
@@ -102,6 +110,7 @@
   </div>
   <div id="stage">
     <canvas id="canvas"></canvas>
+    <canvas id="wm"></canvas>
     <div id="sel"></div>
   </div>
 </main>
@@ -114,6 +123,9 @@ const MODES = {
   fill:  null,                                        // 塗りつぶしは強さなし（色を選ぶ）
 };
 const MAX_UNDO = 30;
+// 透かしの大きさは画像の対角線に対する割合で決める（Retina のスクショでも見た目が同じになる）
+// gapX / gapY は文字の大きさの何倍あけるか
+const WATERMARK = { size: 0.022, color: 'rgba(255, 255, 255, 0.2)', angle: -30, gapX: 3, gapY: 4 };
 const MIN_SELECTION = 4;
 
 const $ = (id) => document.getElementById(id);
@@ -127,6 +139,10 @@ const strength = $('strength');
 const strengthValue = $('strengthValue');
 const undoBtn = $('undoBtn');
 const saveBtn = $('saveBtn');
+const wm = $('wm');
+const wmCtx = wm.getContext('2d');
+const wmOn = $('wmOn');
+const wmText = $('wmText');
 
 let mode = 'pixel';
 let baseName = 'image';
@@ -186,6 +202,7 @@ async function loadFile(file) {
   ctx.drawImage(bitmap, 0, 0);
   bitmap.close && bitmap.close();
   baseName = stripExtension(file.name);
+  renderWatermark();
   undoStack = [];
   loaded = true;
   document.body.classList.add('loaded');
@@ -220,6 +237,47 @@ document.addEventListener('paste', (e) => {
   e.preventDefault();
   loadFile(item.getAsFile());
 });
+
+/* ---------- 透かし ---------- */
+
+// 文字を右上がりに傾けて、画像全体にタイル状に敷き詰める
+function drawWatermark(c, w, h) {
+  const text = wmText.value.trim();
+  if (!wmOn.checked || !text) return;
+  const size = Math.max(12, Math.round(Math.hypot(w, h) * WATERMARK.size));
+  c.save();
+  c.font = `bold ${size}px system-ui, -apple-system, "Hiragino Sans", sans-serif`;
+  c.fillStyle = WATERMARK.color;
+  c.textBaseline = 'middle';
+  c.translate(w / 2, h / 2);
+  c.rotate(WATERMARK.angle * Math.PI / 180);
+  const stepX = c.measureText(text).width + size * WATERMARK.gapX;
+  const stepY = size * (1 + WATERMARK.gapY);
+  const half = Math.hypot(w, h) / 2; // 回転しても隅まで埋まるよう対角線の長さぶん敷く
+  for (let row = 0, y = -half; y <= half; row++, y += stepY) {
+    const shift = row % 2 ? stepX / 2 : 0; // 1行おきに半分ずらしてレンガ状に
+    for (let x = -half - shift; x <= half; x += stepX) c.fillText(text, x, y);
+  }
+  c.restore();
+}
+
+function renderWatermark() {
+  wm.width = canvas.width;
+  wm.height = canvas.height;
+  drawWatermark(wmCtx, wm.width, wm.height);
+}
+
+// 透かしの文字はこのブラウザに覚えておく（使えない環境では毎回空欄）
+try { wmText.value = localStorage.getItem('mozarina.wmText') || ''; wmOn.checked = localStorage.getItem('mozarina.wmOn') === '1'; } catch (e) {}
+function onWatermarkChange() {
+  try { localStorage.setItem('mozarina.wmText', wmText.value); localStorage.setItem('mozarina.wmOn', wmOn.checked ? '1' : '0'); } catch (e) {}
+  if (loaded) renderWatermark();
+}
+wmText.addEventListener('input', () => {
+  if (wmText.value.trim()) wmOn.checked = true; // 文字を入れたら自動でオン
+  onWatermarkChange();
+});
+wmOn.addEventListener('change', onWatermarkChange);
 
 /* ---------- 範囲選択 ---------- */
 
@@ -298,7 +356,7 @@ function applyEffect(x, y, w, h) {
   refreshButtons();
 }
 
-// 四角: 選択範囲の左上から size px 四方に区切り、各ブロックを平均色で塗る（端の余りは小さいまま）
+// モザイク: 選択範囲の左上から size px 四方に区切り、各ブロックを平均色で塗る（端の余りは小さいまま）
 function pixelate(img, size) {
   const { width: w, height: h, data: d } = img;
   for (let by = 0; by < h; by += size) {
@@ -387,9 +445,20 @@ undoBtn.addEventListener('click', undo);
 
 /* ---------- 保存 ---------- */
 
+// 保存用の画像: 作業中の画像に透かしを重ねたもの（作業中の画像そのものは変えない）
+function exportCanvas() {
+  const out = document.createElement('canvas');
+  out.width = canvas.width;
+  out.height = canvas.height;
+  const c = out.getContext('2d');
+  c.drawImage(canvas, 0, 0);
+  drawWatermark(c, out.width, out.height);
+  return out;
+}
+
 function save() {
   if (!loaded) return;
-  canvas.toBlob((blob) => {
+  exportCanvas().toBlob((blob) => {
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
