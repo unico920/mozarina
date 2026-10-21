@@ -63,6 +63,10 @@
 Chrome / Edge / Safari / Firefox の最近のバージョン。
 読み込める形式は JPG・PNG・WebP など、ブラウザが表示できる画像です。スマホで撮った写真の向き（EXIF）も自動で反映されます。
 
+## もし動かなかったら
+
+clone してお使いの AI に修正してもらってください。
+
 ## 作った人
 
 [Claude Code](https://claude.com/claude-code)（Anthropic の AI）で作りました。
